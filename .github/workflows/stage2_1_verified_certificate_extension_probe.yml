@@ -1,0 +1,471 @@
+name: Stage2.1 Verified Certificate Extension Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  attestations: read
+
+jobs:
+  verified-extension-probe:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Acquire exact verifier and trusted roots
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          GH_VERSION="2.99.0"
+          GH_ARCHIVE="gh_${GH_VERSION}_linux_amd64.tar.gz"
+          GH_DIR="gh_${GH_VERSION}_linux_amd64"
+          BASE_URL="https://github.com/cli/cli/releases/download/v${GH_VERSION}"
+
+          EXPECTED_ARCHIVE_SHA256="ed4960225d2833e04a61590d9fa2b5773d147f3aa375459e5466a40c102f3832"
+          EXPECTED_EXECUTABLE_SHA256="d0a901528411dfc2295253ba4183b99788f99c5901e3a6dda9172089c42d3b85"
+          EXPECTED_TRUSTED_ROOT_SHA256="65ca537f6ed8a47fd0e560c421baa1f6c1efb8b25fc200d8c5c02c0e92eb2b9c"
+
+          mkdir -p evidence/verifier evidence/probe evidence/result evidence/parser
+
+          curl --fail --location --silent --show-error \
+            "${BASE_URL}/gh_${GH_VERSION}_checksums.txt" \
+            -o "evidence/verifier/gh_${GH_VERSION}_checksums.txt"
+
+          curl --fail --location --silent --show-error \
+            "${BASE_URL}/${GH_ARCHIVE}" \
+            -o "evidence/verifier/${GH_ARCHIVE}"
+
+          ARCHIVE_SHA="$(
+            sha256sum "evidence/verifier/${GH_ARCHIVE}" | awk '{print $1}'
+          )"
+          test "${ARCHIVE_SHA}" = "${EXPECTED_ARCHIVE_SHA256}"
+
+          grep " ${GH_ARCHIVE}\$" \
+            "evidence/verifier/gh_${GH_VERSION}_checksums.txt" \
+            > evidence/verifier/official_checksum_line.txt
+
+          (
+            cd evidence/verifier
+            grep " ${GH_ARCHIVE}\$" "gh_${GH_VERSION}_checksums.txt" \
+              | sha256sum --check --strict
+          ) > evidence/verifier/archive_checksum_verification.txt
+
+          tar -xzf "evidence/verifier/${GH_ARCHIVE}" -C evidence/verifier
+
+          GH_BIN="${GITHUB_WORKSPACE}/evidence/verifier/${GH_DIR}/bin/gh"
+
+          EXEC_SHA="$(sha256sum "${GH_BIN}" | awk '{print $1}')"
+          test "${EXEC_SHA}" = "${EXPECTED_EXECUTABLE_SHA256}"
+
+          "${GH_BIN}" version > evidence/verifier/gh_version.txt
+          sha256sum "${GH_BIN}" > evidence/verifier/gh_executable_sha256.txt
+
+          "${GH_BIN}" attestation trusted-root \
+            > evidence/verifier/trusted_root.jsonl
+
+          ROOT_SHA="$(
+            sha256sum evidence/verifier/trusted_root.jsonl | awk '{print $1}'
+          )"
+          test "${ROOT_SHA}" = "${EXPECTED_TRUSTED_ROOT_SHA256}"
+
+          sha256sum evidence/verifier/trusted_root.jsonl \
+            > evidence/verifier/trusted_root_sha256.txt
+
+      - name: Resolve and recover original attested subject
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          GH_BIN="${GITHUB_WORKSPACE}/evidence/verifier/gh_2.99.0_linux_amd64/bin/gh"
+
+          EXPECTED_COMMIT="24c17ccccc21029c5eed95917f429a7b688a6f83"
+          EXPECTED_SUBJECT_SHA256="44e02620034c8c5e3d9de09cc655d60dee2fefabcefb17ad8f068cf4ece9edc4"
+
+          "${GH_BIN}" run list \
+            --repo andrearomeo74-cloud/LIMEN-AEE \
+            --workflow aee_attest_probe.yml \
+            --limit 100 \
+            --json databaseId,number,headSha,event,status,conclusion,url \
+            > evidence/probe/probe_runs.json
+
+          jq \
+            '[.[] | select(.number == 1)]' \
+            evidence/probe/probe_runs.json \
+            > evidence/probe/original_probe_run.json
+
+          test "$(jq 'length' evidence/probe/original_probe_run.json)" -eq 1
+          test "$(jq -r '.[0].headSha' evidence/probe/original_probe_run.json)" = "${EXPECTED_COMMIT}"
+          test "$(jq -r '.[0].event' evidence/probe/original_probe_run.json)" = "workflow_dispatch"
+          test "$(jq -r '.[0].conclusion' evidence/probe/original_probe_run.json)" = "success"
+
+          RUN_ID="$(
+            jq -r '.[0].databaseId' evidence/probe/original_probe_run.json
+          )"
+
+          mkdir -p evidence/probe/artifact
+
+          "${GH_BIN}" run download "${RUN_ID}" \
+            --repo andrearomeo74-cloud/LIMEN-AEE \
+            --name aee-stage2-probe \
+            --dir evidence/probe/artifact
+
+          SUBJECT_SHA="$(
+            sha256sum evidence/probe/artifact/aee_subject.tar | awk '{print $1}'
+          )"
+
+          test "${SUBJECT_SHA}" = "${EXPECTED_SUBJECT_SHA256}"
+
+          sha256sum evidence/probe/artifact/aee_subject.tar \
+            > evidence/probe/subject_sha256.txt
+
+      - name: Recover exact attestation bundle
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          GH_BIN="${GITHUB_WORKSPACE}/evidence/verifier/gh_2.99.0_linux_amd64/bin/gh"
+
+          cd evidence/probe
+
+          "${GH_BIN}" attestation download \
+            artifact/aee_subject.tar \
+            --repo andrearomeo74-cloud/LIMEN-AEE
+
+          EXPECTED_FILE="sha256:44e02620034c8c5e3d9de09cc655d60dee2fefabcefb17ad8f068cf4ece9edc4.jsonl"
+
+          test -f "${EXPECTED_FILE}"
+          mv "${EXPECTED_FILE}" attestation_bundle.jsonl
+
+          sha256sum attestation_bundle.jsonl \
+            > attestation_bundle_sha256.txt
+
+      - name: Perform exact attestation verification
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GH_BIN="${GITHUB_WORKSPACE}/evidence/verifier/gh_2.99.0_linux_amd64/bin/gh"
+          SUBJECT="${GITHUB_WORKSPACE}/evidence/probe/artifact/aee_subject.tar"
+          BUNDLE="${GITHUB_WORKSPACE}/evidence/probe/attestation_bundle.jsonl"
+          ROOT="${GITHUB_WORKSPACE}/evidence/verifier/trusted_root.jsonl"
+          OUT="${GITHUB_WORKSPACE}/evidence/result/verification_result.json"
+
+          mkdir -p evidence/result/isolated_home
+
+          env -i \
+            PATH="/usr/bin:/bin" \
+            HOME="${GITHUB_WORKSPACE}/evidence/result/isolated_home" \
+            "${GH_BIN}" attestation verify "${SUBJECT}" \
+              --bundle "${BUNDLE}" \
+              --custom-trusted-root "${ROOT}" \
+              --repo andrearomeo74-cloud/LIMEN-AEE \
+              --signer-workflow andrearomeo74-cloud/LIMEN-AEE/.github/workflows/aee_attest_probe.yml \
+              --source-digest 24c17ccccc21029c5eed95917f429a7b688a6f83 \
+              --signer-digest 24c17ccccc21029c5eed95917f429a7b688a6f83 \
+              --source-ref refs/heads/main \
+              --cert-oidc-issuer https://token.actions.githubusercontent.com \
+              --deny-self-hosted-runners \
+              --format json \
+              > "${OUT}"
+
+          test "$(jq 'length' "${OUT}")" -eq 1
+
+          sha256sum "${OUT}" \
+            > evidence/result/verification_result_sha256.txt
+
+      - name: Freeze deterministic DER extension parser
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > evidence/parser/extract_cert_extension.py <<'PY'
+          import base64
+          import json
+          import sys
+          from pathlib import Path
+
+          TARGET_OID = "1.3.6.1.4.1.57264.1.23"
+          EXPECTED_VALUE = "TED_PREVIEW"
+
+          class DERError(Exception):
+              pass
+
+          def read_length(data, pos):
+              if pos >= len(data):
+                  raise DERError("missing length")
+              first = data[pos]
+              pos += 1
+              if first < 0x80:
+                  return first, pos
+              n = first & 0x7f
+              if n == 0 or n > 4:
+                  raise DERError("invalid DER length form")
+              if pos + n > len(data):
+                  raise DERError("truncated length")
+              if data[pos] == 0:
+                  raise DERError("non-minimal DER length")
+              length = int.from_bytes(data[pos:pos+n], "big")
+              pos += n
+              if length < 0x80:
+                  raise DERError("non-minimal long length")
+              return length, pos
+
+          def read_tlv(data, pos):
+              if pos >= len(data):
+                  raise DERError("missing tag")
+              tag = data[pos]
+              pos += 1
+              length, pos = read_length(data, pos)
+              end = pos + length
+              if end > len(data):
+                  raise DERError("truncated value")
+              return tag, pos, end, end
+
+          def children(data, start, end):
+              out = []
+              pos = start
+              while pos < end:
+                  tag, vstart, vend, nxt = read_tlv(data, pos)
+                  out.append((tag, vstart, vend))
+                  pos = nxt
+              if pos != end:
+                  raise DERError("container length mismatch")
+              return out
+
+          def decode_oid(raw):
+              if not raw:
+                  raise DERError("empty OID")
+              first = raw[0]
+              arcs = [first // 40, first % 40]
+              value = 0
+              open_arc = False
+              for b in raw[1:]:
+                  open_arc = True
+                  value = (value << 7) | (b & 0x7f)
+                  if not (b & 0x80):
+                      arcs.append(value)
+                      value = 0
+                      open_arc = False
+              if open_arc:
+                  raise DERError("truncated OID")
+              return ".".join(str(x) for x in arcs)
+
+          def parse_utf8_der(raw):
+              tag, start, end, nxt = read_tlv(raw, 0)
+              if nxt != len(raw):
+                  raise DERError("trailing bytes in extension value")
+              if tag != 0x0c:
+                  raise DERError(
+                      f"deploymentEnvironment inner tag is 0x{tag:02x}, expected UTF8String"
+                  )
+              try:
+                  return raw[start:end].decode("utf-8")
+              except UnicodeDecodeError as exc:
+                  raise DERError("invalid UTF-8") from exc
+
+          def extract_extensions_from_certificate(cert):
+              tag, cstart, cend, cnxt = read_tlv(cert, 0)
+              if tag != 0x30 or cnxt != len(cert):
+                  raise DERError("certificate is not one canonical outer SEQUENCE")
+
+              cert_children = children(cert, cstart, cend)
+              if len(cert_children) != 3:
+                  raise DERError("unexpected Certificate structure")
+
+              ttag, tstart, tend = cert_children[0]
+              if ttag != 0x30:
+                  raise DERError("TBSCertificate is not SEQUENCE")
+
+              tbs = children(cert, tstart, tend)
+              ext_containers = [x for x in tbs if x[0] == 0xa3]
+
+              if len(ext_containers) != 1:
+                  raise DERError(
+                      f"expected exactly one [3] extensions container, found {len(ext_containers)}"
+                  )
+
+              _, estart, eend = ext_containers[0]
+              wrapper = children(cert, estart, eend)
+
+              if len(wrapper) != 1 or wrapper[0][0] != 0x30:
+                  raise DERError("invalid Extensions wrapper")
+
+              _, xstart, xend = wrapper[0]
+              extension_entries = children(cert, xstart, xend)
+
+              matches = []
+
+              for entry in extension_entries:
+                  if entry[0] != 0x30:
+                      raise DERError("Extension entry is not SEQUENCE")
+
+                  parts = children(cert, entry[1], entry[2])
+
+                  if len(parts) not in (2, 3):
+                      raise DERError("unexpected Extension field count")
+
+                  if parts[0][0] != 0x06:
+                      raise DERError("Extension missing OID")
+
+                  oid = decode_oid(cert[parts[0][1]:parts[0][2]])
+
+                  value_index = 1
+                  if len(parts) == 3:
+                      if parts[1][0] != 0x01:
+                          raise DERError("unexpected middle Extension field")
+                      value_index = 2
+
+                  if parts[value_index][0] != 0x04:
+                      raise DERError("Extension value is not OCTET STRING")
+
+                  if oid == TARGET_OID:
+                      raw_inner = cert[
+                          parts[value_index][1]:
+                          parts[value_index][2]
+                      ]
+                      matches.append(parse_utf8_der(raw_inner))
+
+              return matches
+
+          def main():
+              source = Path("evidence/result/verification_result.json")
+              data = json.loads(source.read_text())
+
+              if not isinstance(data, list) or len(data) != 1:
+                  raise DERError(
+                      "verified result must contain exactly one attestation"
+                  )
+
+              try:
+                  raw_b64 = (
+                      data[0]["attestation"]["bundle"]
+                      ["verificationMaterial"]["certificate"]["rawBytes"]
+                  )
+              except Exception as exc:
+                  raise DERError(
+                      "verified bundle certificate rawBytes missing"
+                  ) from exc
+
+              if not isinstance(raw_b64, str) or not raw_b64:
+                  raise DERError("rawBytes is not a non-empty base64 string")
+
+              try:
+                  cert = base64.b64decode(raw_b64, validate=True)
+              except Exception as exc:
+                  raise DERError("invalid certificate base64") from exc
+
+              Path("evidence/result/verified_certificate.der").write_bytes(cert)
+
+              matches = extract_extensions_from_certificate(cert)
+
+              result = {
+                  "source_json_pointer":
+                    "/0/attestation/bundle/verificationMaterial/certificate/rawBytes",
+                  "target_oid": TARGET_OID,
+                  "expected_value": EXPECTED_VALUE,
+                  "occurrence_count": len(matches),
+                  "observed_values": matches,
+                  "status": "PASS"
+                    if matches == [EXPECTED_VALUE]
+                    else "STOP"
+              }
+
+              Path(
+                  "evidence/result/deployment_environment_extraction.json"
+              ).write_text(
+                  json.dumps(result, indent=2, sort_keys=True) + "\n"
+              )
+
+              if len(matches) != 1:
+                  raise DERError(
+                      f"expected exactly one {TARGET_OID}, found {len(matches)}"
+                  )
+
+              if matches[0] != EXPECTED_VALUE:
+                  raise DERError(
+                      f"value mismatch: {matches[0]!r}"
+                  )
+
+              print(
+                  f"PASS: {TARGET_OID} = {EXPECTED_VALUE}"
+              )
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as exc:
+                  print(f"STOP: {exc}", file=sys.stderr)
+                  raise SystemExit(1)
+          PY
+
+          sha256sum evidence/parser/extract_cert_extension.py \
+            > evidence/parser/parser_source_sha256.txt
+
+          python3 --version \
+            > evidence/parser/python_version.txt 2>&1
+
+          PYTHON_BIN="$(command -v python3)"
+          printf '%s\n' "${PYTHON_BIN}" \
+            > evidence/parser/python_binary_path.txt
+
+          sha256sum "${PYTHON_BIN}" \
+            > evidence/parser/python_binary_sha256.txt
+
+      - name: Extract verified Deployment Environment extension
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 evidence/parser/extract_cert_extension.py \
+            | tee evidence/result/extension_probe_stdout.txt
+
+          sha256sum evidence/result/verified_certificate.der \
+            > evidence/result/verified_certificate_der_sha256.txt
+
+          sha256sum \
+            evidence/result/deployment_environment_extraction.json \
+            > evidence/result/deployment_environment_extraction_sha256.txt
+
+      - name: Preserve Stage2.1 semantic status
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "evidence_class=VERIFIED_CERTIFICATE_EXTENSION_PROBE_ONLY"
+            echo "authority_conferred=false"
+            echo "build_allowed=false"
+            echo "end_to_end_permit_allowed=false"
+            echo "live_ted_called=false"
+            echo "target_oid=1.3.6.1.4.1.57264.1.23"
+            echo "expected_environment=TED_PREVIEW"
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "workflow=${GITHUB_WORKFLOW}"
+            echo "commit=${GITHUB_SHA}"
+            echo "event=${GITHUB_EVENT_NAME}"
+          } > evidence/result/stage2_1_semantic_status.txt
+
+          find evidence -type f \
+            ! -name complete_evidence_inventory.sha256 \
+            -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            > evidence/complete_evidence_inventory.sha256
+
+      - name: Upload complete Stage2.1 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aee-stage2-1-verified-extension-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30

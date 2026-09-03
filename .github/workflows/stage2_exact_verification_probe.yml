@@ -1,0 +1,338 @@
+name: Stage2 Exact Verification Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  attestations: read
+
+jobs:
+  exact-verification:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Acquire and freeze exact verifier
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          GH_VERSION="2.99.0"
+          GH_ARCHIVE="gh_${GH_VERSION}_linux_amd64.tar.gz"
+          GH_DIR="gh_${GH_VERSION}_linux_amd64"
+          BASE_URL="https://github.com/cli/cli/releases/download/v${GH_VERSION}"
+
+          EXPECTED_ARCHIVE_SHA256="ed4960225d2833e04a61590d9fa2b5773d147f3aa375459e5466a40c102f3832"
+          EXPECTED_EXECUTABLE_SHA256="d0a901528411dfc2295253ba4183b99788f99c5901e3a6dda9172089c42d3b85"
+          EXPECTED_TRUSTED_ROOT_SHA256="65ca537f6ed8a47fd0e560c421baa1f6c1efb8b25fc200d8c5c02c0e92eb2b9c"
+
+          mkdir -p evidence/verifier evidence/probe evidence/result
+
+          curl --fail --location --silent --show-error \
+            "${BASE_URL}/gh_${GH_VERSION}_checksums.txt" \
+            -o "evidence/verifier/gh_${GH_VERSION}_checksums.txt"
+
+          curl --fail --location --silent --show-error \
+            "${BASE_URL}/${GH_ARCHIVE}" \
+            -o "evidence/verifier/${GH_ARCHIVE}"
+
+          ACTUAL_ARCHIVE_SHA256="$(
+            sha256sum "evidence/verifier/${GH_ARCHIVE}" | awk '{print $1}'
+          )"
+
+          printf '%s  %s\n' \
+            "${ACTUAL_ARCHIVE_SHA256}" \
+            "${GH_ARCHIVE}" \
+            > evidence/verifier/actual_archive_sha256.txt
+
+          test "${ACTUAL_ARCHIVE_SHA256}" = "${EXPECTED_ARCHIVE_SHA256}"
+
+          grep " ${GH_ARCHIVE}\$" \
+            "evidence/verifier/gh_${GH_VERSION}_checksums.txt" \
+            > evidence/verifier/official_checksum_line.txt
+
+          (
+            cd evidence/verifier
+            grep " ${GH_ARCHIVE}\$" "gh_${GH_VERSION}_checksums.txt" \
+              | sha256sum --check --strict
+          ) > evidence/verifier/official_checksum_verification.txt
+
+          tar -xzf "evidence/verifier/${GH_ARCHIVE}" \
+            -C evidence/verifier
+
+          GH_BIN="${GITHUB_WORKSPACE}/evidence/verifier/${GH_DIR}/bin/gh"
+
+          ACTUAL_EXECUTABLE_SHA256="$(
+            sha256sum "${GH_BIN}" | awk '{print $1}'
+          )"
+
+          printf '%s  gh\n' "${ACTUAL_EXECUTABLE_SHA256}" \
+            > evidence/verifier/actual_executable_sha256.txt
+
+          test "${ACTUAL_EXECUTABLE_SHA256}" = "${EXPECTED_EXECUTABLE_SHA256}"
+
+          "${GH_BIN}" version \
+            > evidence/verifier/gh_version.txt
+
+          "${GH_BIN}" attestation trusted-root \
+            > evidence/verifier/trusted_root.jsonl
+
+          ACTUAL_TRUSTED_ROOT_SHA256="$(
+            sha256sum evidence/verifier/trusted_root.jsonl | awk '{print $1}'
+          )"
+
+          printf '%s  trusted_root.jsonl\n' \
+            "${ACTUAL_TRUSTED_ROOT_SHA256}" \
+            > evidence/verifier/actual_trusted_root_sha256.txt
+
+          test "${ACTUAL_TRUSTED_ROOT_SHA256}" = "${EXPECTED_TRUSTED_ROOT_SHA256}"
+
+          printf '%s\n' "${GH_BIN}" \
+            > evidence/verifier/exact_gh_binary_path.txt
+
+      - name: Resolve exact original probe run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          GH_BIN="${GITHUB_WORKSPACE}/evidence/verifier/gh_2.99.0_linux_amd64/bin/gh"
+
+          EXPECTED_PROBE_RUN_NUMBER="1"
+          EXPECTED_PROBE_COMMIT="24c17ccccc21029c5eed95917f429a7b688a6f83"
+          EXPECTED_EVENT="workflow_dispatch"
+
+          "${GH_BIN}" run list \
+            --repo andrearomeo74-cloud/LIMEN-AEE \
+            --workflow aee_attest_probe.yml \
+            --limit 100 \
+            --json databaseId,number,headSha,event,status,conclusion,url \
+            > evidence/probe/probe_runs.json
+
+          jq --argjson n "${EXPECTED_PROBE_RUN_NUMBER}" \
+             '[.[] | select(.number == $n)]' \
+             evidence/probe/probe_runs.json \
+             > evidence/probe/resolved_probe_run.json
+
+          MATCH_COUNT="$(
+            jq 'length' evidence/probe/resolved_probe_run.json
+          )"
+
+          test "${MATCH_COUNT}" -eq 1
+
+          RUN_ID="$(
+            jq -r '.[0].databaseId' evidence/probe/resolved_probe_run.json
+          )"
+
+          HEAD_SHA="$(
+            jq -r '.[0].headSha' evidence/probe/resolved_probe_run.json
+          )"
+
+          EVENT="$(
+            jq -r '.[0].event' evidence/probe/resolved_probe_run.json
+          )"
+
+          CONCLUSION="$(
+            jq -r '.[0].conclusion' evidence/probe/resolved_probe_run.json
+          )"
+
+          test "${HEAD_SHA}" = "${EXPECTED_PROBE_COMMIT}"
+          test "${EVENT}" = "${EXPECTED_EVENT}"
+          test "${CONCLUSION}" = "success"
+
+          printf '%s\n' "${RUN_ID}" \
+            > evidence/probe/probe_run_id.txt
+
+      - name: Download exact original subject
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          GH_BIN="${GITHUB_WORKSPACE}/evidence/verifier/gh_2.99.0_linux_amd64/bin/gh"
+          RUN_ID="$(cat evidence/probe/probe_run_id.txt)"
+
+          mkdir -p evidence/probe/artifact
+
+          "${GH_BIN}" run download "${RUN_ID}" \
+            --repo andrearomeo74-cloud/LIMEN-AEE \
+            --name aee-stage2-probe \
+            --dir evidence/probe/artifact
+
+          test -f evidence/probe/artifact/aee_subject.tar
+          test -f evidence/probe/artifact/subject.sha256
+
+          EXPECTED_SUBJECT_SHA256="44e02620034c8c5e3d9de09cc655d60dee2fefabcefb17ad8f068cf4ece9edc4"
+
+          ACTUAL_SUBJECT_SHA256="$(
+            sha256sum evidence/probe/artifact/aee_subject.tar | awk '{print $1}'
+          )"
+
+          test "${ACTUAL_SUBJECT_SHA256}" = "${EXPECTED_SUBJECT_SHA256}"
+
+          grep -q "^${EXPECTED_SUBJECT_SHA256} " \
+            evidence/probe/artifact/subject.sha256
+
+          sha256sum evidence/probe/artifact/aee_subject.tar \
+            > evidence/probe/independent_subject_sha256.txt
+
+      - name: Download attestation bundle for exact subject
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          GH_BIN="${GITHUB_WORKSPACE}/evidence/verifier/gh_2.99.0_linux_amd64/bin/gh"
+
+          cd evidence/probe
+
+          "${GH_BIN}" attestation download \
+            artifact/aee_subject.tar \
+            --repo andrearomeo74-cloud/LIMEN-AEE
+
+          EXPECTED_BUNDLE="sha256:44e02620034c8c5e3d9de09cc655d60dee2fefabcefb17ad8f068cf4ece9edc4.jsonl"
+
+          test -f "${EXPECTED_BUNDLE}"
+
+          mv "${EXPECTED_BUNDLE}" attestation_bundle.jsonl
+
+          sha256sum attestation_bundle.jsonl \
+            > attestation_bundle_sha256.txt
+
+      - name: Exact verifier offline-input verification
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GH_BIN="${GITHUB_WORKSPACE}/evidence/verifier/gh_2.99.0_linux_amd64/bin/gh"
+          SUBJECT="${GITHUB_WORKSPACE}/evidence/probe/artifact/aee_subject.tar"
+          BUNDLE="${GITHUB_WORKSPACE}/evidence/probe/attestation_bundle.jsonl"
+          ROOT="${GITHUB_WORKSPACE}/evidence/verifier/trusted_root.jsonl"
+          OUT="${GITHUB_WORKSPACE}/evidence/result/verification_result.json"
+
+          mkdir -p "${GITHUB_WORKSPACE}/evidence/result/isolated_home"
+
+          env -i \
+            PATH="/usr/bin:/bin" \
+            HOME="${GITHUB_WORKSPACE}/evidence/result/isolated_home" \
+            "${GH_BIN}" attestation verify "${SUBJECT}" \
+              --bundle "${BUNDLE}" \
+              --custom-trusted-root "${ROOT}" \
+              --repo andrearomeo74-cloud/LIMEN-AEE \
+              --signer-workflow andrearomeo74-cloud/LIMEN-AEE/.github/workflows/aee_attest_probe.yml \
+              --source-digest 24c17ccccc21029c5eed95917f429a7b688a6f83 \
+              --signer-digest 24c17ccccc21029c5eed95917f429a7b688a6f83 \
+              --source-ref refs/heads/main \
+              --cert-oidc-issuer https://token.actions.githubusercontent.com \
+              --deny-self-hosted-runners \
+              --format json \
+              > "${OUT}"
+
+          test "$(jq 'length' "${OUT}")" -ge 1
+
+          sha256sum "${OUT}" \
+            > evidence/result/verification_result_sha256.txt
+
+      - name: Discover exact verified claim pointers
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+
+          src = Path("evidence/result/verification_result.json")
+          data = json.loads(src.read_text())
+
+          targets = {
+              "TED_PREVIEW",
+              "github-hosted",
+              "workflow_dispatch",
+              "refs/heads/main",
+              "24c17ccccc21029c5eed95917f429a7b688a6f83",
+              "https://github.com/andrearomeo74-cloud/LIMEN-AEE",
+              "44e02620034c8c5e3d9de09cc655d60dee2fefabcefb17ad8f068cf4ece9edc4",
+          }
+
+          hits = []
+
+          def esc(s):
+              return str(s).replace("~", "~0").replace("/", "~1")
+
+          def walk(x, pointer=""):
+              if isinstance(x, dict):
+                  for k, v in x.items():
+                      walk(v, pointer + "/" + esc(k))
+              elif isinstance(x, list):
+                  for i, v in enumerate(x):
+                      walk(v, pointer + "/" + str(i))
+              else:
+                  if str(x) in targets:
+                      hits.append({
+                          "json_pointer": pointer or "/",
+                          "value": x
+                      })
+
+          walk(data)
+
+          Path("evidence/result/observed_exact_claim_pointers.json").write_text(
+              json.dumps(hits, indent=2, sort_keys=True) + "\n"
+          )
+
+          certs = []
+          for item in data:
+              try:
+                  certs.append(
+                      item["verificationResult"]["signature"]["certificate"]
+                  )
+              except Exception:
+                  pass
+
+          Path("evidence/result/verified_certificate_objects.json").write_text(
+              json.dumps(certs, indent=2, sort_keys=True) + "\n"
+          )
+
+          if not any(h["value"] == "TED_PREVIEW" for h in hits):
+              raise SystemExit(
+                  "STOP: TED_PREVIEW not exposed in verified JSON output"
+              )
+          PY
+
+      - name: Preserve complete probe evidence inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "evidence_class=ACQUISITION_PROBE_EVIDENCE_ONLY"
+            echo "authority_conferred=false"
+            echo "build_allowed=false"
+            echo "end_to_end_permit_allowed=false"
+            echo "live_ted_called=false"
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "verification_workflow=${GITHUB_WORKFLOW}"
+            echo "verification_commit=${GITHUB_SHA}"
+            echo "verification_event=${GITHUB_EVENT_NAME}"
+          } > evidence/result/probe_semantic_status.txt
+
+          find evidence -type f \
+            ! -name complete_evidence_inventory.sha256 \
+            -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            > evidence/complete_evidence_inventory.sha256
+
+      - name: Upload complete Stage2 exact verification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: aee-stage2-exact-verification-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30

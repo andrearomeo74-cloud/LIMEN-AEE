@@ -1,0 +1,97 @@
+name: Stage2 Dependency Root Acquisition
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Acquire exact GitHub CLI release and trusted roots
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GH_VERSION="2.99.0"
+          GH_ARCHIVE="gh_${GH_VERSION}_linux_amd64.tar.gz"
+          GH_DIR="gh_${GH_VERSION}_linux_amd64"
+          BASE_URL="https://github.com/cli/cli/releases/download/v${GH_VERSION}"
+
+          mkdir -p evidence
+
+          echo "== Download release checksum manifest =="
+          curl --fail --location --silent --show-error \
+            "${BASE_URL}/gh_${GH_VERSION}_checksums.txt" \
+            -o evidence/gh_${GH_VERSION}_checksums.txt
+
+          echo "== Download exact linux_amd64 archive =="
+          curl --fail --location --silent --show-error \
+            "${BASE_URL}/${GH_ARCHIVE}" \
+            -o "evidence/${GH_ARCHIVE}"
+
+          echo "== Compute archive SHA-256 =="
+          sha256sum "evidence/${GH_ARCHIVE}" \
+            | tee evidence/gh_archive_sha256.txt
+
+          echo "== Preserve official checksum line =="
+          grep " ${GH_ARCHIVE}\$" \
+            "evidence/gh_${GH_VERSION}_checksums.txt" \
+            | tee evidence/official_checksum_line.txt
+
+          echo "== Verify archive against official checksum =="
+          (
+            cd evidence
+            grep " ${GH_ARCHIVE}\$" "gh_${GH_VERSION}_checksums.txt" \
+              | sha256sum --check --strict
+          ) | tee evidence/archive_checksum_verification.txt
+
+          echo "== Extract exact GitHub CLI =="
+          tar -xzf "evidence/${GH_ARCHIVE}" -C evidence
+
+          GH_BIN="${GITHUB_WORKSPACE}/evidence/${GH_DIR}/bin/gh"
+
+          echo "== Compute executable SHA-256 =="
+          sha256sum "${GH_BIN}" \
+            | tee evidence/gh_executable_sha256.txt
+
+          echo "== Record exact version =="
+          "${GH_BIN}" version \
+            | tee evidence/gh_version.txt
+
+          echo "== Acquire current trusted root set =="
+          "${GH_BIN}" attestation trusted-root \
+            > evidence/trusted_root.jsonl
+
+          echo "== Hash trusted root set =="
+          sha256sum evidence/trusted_root.jsonl \
+            | tee evidence/trusted_root_sha256.txt
+
+          echo "== Record acquisition metadata =="
+          {
+            echo "workflow=${GITHUB_WORKFLOW}"
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "commit=${GITHUB_SHA}"
+            echo "ref=${GITHUB_REF}"
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "gh_version=${GH_VERSION}"
+          } > evidence/acquisition_metadata.txt
+
+          echo "== Evidence inventory =="
+          find evidence -maxdepth 3 -type f -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            > evidence/evidence_inventory.sha256
+
+      - name: Preserve exact Stage2 dependency/root evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: aee-stage2-dependency-root-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30

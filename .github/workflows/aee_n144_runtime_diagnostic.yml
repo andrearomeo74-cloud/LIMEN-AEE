@@ -22,21 +22,134 @@ jobs:
           uname -m
           id
 
-      - name: Verify diagnostic package
+      - name: Verify required packages
         run: |
+          test -f AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.1.zip
+          test -f AEE_EXECUTION_WRAPPER_PATCH_v0.1.zip
           test -f AEE_N144_RUNTIME_DIAGNOSTIC_v0.1.zip
 
-          DIAG_SHA="$(
-            sha256sum AEE_N144_RUNTIME_DIAGNOSTIC_v0.1.zip \
-            | awk '{print $1}'
-          )"
+          BASE_SHA="$(sha256sum AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.1.zip | awk '{print $1}')"
+          PATCH_SHA="$(sha256sum AEE_EXECUTION_WRAPPER_PATCH_v0.1.zip | awk '{print $1}')"
+          DIAG_SHA="$(sha256sum AEE_N144_RUNTIME_DIAGNOSTIC_v0.1.zip | awk '{print $1}')"
+
+          test "$BASE_SHA" = \
+            "39fe56f758b3fddd58c22bf621b16e69eab7122359a6989bafa2163852dc1372"
+
+          test "$PATCH_SHA" = \
+            "947c56b94b1bf956dc351223efe0ae9bc566506fd5ae132b1cb8023e5ff5c290"
 
           test "$DIAG_SHA" = \
             "cf40a09b52b1b46a3cbbfd7ad4d7f5d3b7d7a8721c5ffee14c27dd895bc7d544"
 
-          echo "Diagnostic package SHA-256: $DIAG_SHA"
+          echo "Base environment: $BASE_SHA"
+          echo "Wrapper patch:    $PATCH_SHA"
+          echo "Diagnostic:       $DIAG_SHA"
 
-      - name: Extract diagnostic package
+      - name: Reconstruct verified execution environment
+        run: |
+          rm -rf aee_post_build_environment
+          mkdir aee_post_build_environment
+
+          unzip -q AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.1.zip \
+            -d aee_post_build_environment
+
+          ENV_ROOT="$(
+            find aee_post_build_environment \
+              -type f \
+              -path '*/scripts/run_gate.sh' \
+              -printf '%h\n' \
+            | sed 's#/scripts$##' \
+            | head -n 1
+          )"
+
+          test -n "$ENV_ROOT"
+
+          echo "$ENV_ROOT" > /tmp/aee_env_root
+          echo "Environment root: $ENV_ROOT"
+
+      - name: Apply verified wrapper remediation
+        run: |
+          ENV_ROOT="$(cat /tmp/aee_env_root)"
+
+          rm -rf aee_wrapper_patch
+          mkdir aee_wrapper_patch
+
+          unzip -q AEE_EXECUTION_WRAPPER_PATCH_v0.1.zip \
+            -d aee_wrapper_patch
+
+          PATCH_ROOT="$(
+            find aee_wrapper_patch \
+              -type f \
+              -path '*/scripts/verify_and_stage.py' \
+              -printf '%h\n' \
+            | sed 's#/scripts$##' \
+            | head -n 1
+          )"
+
+          test -n "$PATCH_ROOT"
+
+          SCRIPT_SHA="$(
+            sha256sum "$PATCH_ROOT/scripts/verify_and_stage.py" \
+            | awk '{print $1}'
+          )"
+
+          test "$SCRIPT_SHA" = \
+            "d3a5d1012cffdf1abb559ec3b4224a661423fbeb9d925d64a7528982d92a14d2"
+
+          cp "$PATCH_ROOT/scripts/verify_and_stage.py" \
+            "$ENV_ROOT/scripts/verify_and_stage.py"
+
+          INSTALLED_SHA="$(
+            sha256sum "$ENV_ROOT/scripts/verify_and_stage.py" \
+            | awk '{print $1}'
+          )"
+
+          test "$INSTALLED_SHA" = "$SCRIPT_SHA"
+
+          echo "Verified wrapper installed: $INSTALLED_SHA"
+
+      - name: Verify exact candidate and stage TCB
+        run: |
+          ENV_ROOT="$(cat /tmp/aee_env_root)"
+
+          CANDIDATE="$ENV_ROOT/payload/AEE_IMPLEMENTATION_CANDIDATE_v0.2.1_FROM_v0.1.8.zip"
+
+          test -f "$CANDIDATE"
+
+          CANDIDATE_SHA="$(
+            sha256sum "$CANDIDATE" \
+            | awk '{print $1}'
+          )"
+
+          test "$CANDIDATE_SHA" = \
+            "1e12e8dcc67f9511c15c1691975fec02238a52e03e319fe3251ca5a5fc23d527"
+
+          cd "$ENV_ROOT"
+
+          sudo python3 scripts/verify_and_stage.py
+
+          test -f work/candidate/tcb/gh
+          test -f work/candidate/tcb/trusted_root.jsonl
+
+          GH_SHA="$(
+            sha256sum work/candidate/tcb/gh \
+            | awk '{print $1}'
+          )"
+
+          ROOT_SHA="$(
+            sha256sum work/candidate/tcb/trusted_root.jsonl \
+            | awk '{print $1}'
+          )"
+
+          test "$GH_SHA" = \
+            "d0a901528411dfc2295253ba4183b99788f99c5901e3a6dda9172089c42d3b85"
+
+          test "$ROOT_SHA" = \
+            "65ca537f6ed8a47fd0e560c421baa1f6c1efb8b25fc200d8c5c02c0e92eb2b9c"
+
+          echo "Exact candidate and TCB staging verified."
+
+      - name: Extract diagnostic probe
         run: |
           rm -rf aee_n144_runtime_diagnostic
           mkdir aee_n144_runtime_diagnostic
@@ -49,6 +162,7 @@ jobs:
               -type f \
               -name 'run_diagnostic.sh' \
               -printf '%h\n' \
+            | sed 's#/scripts$##' \
             | head -n 1
           )"
 
@@ -57,19 +171,39 @@ jobs:
           echo "$DIAG_ROOT" > /tmp/aee_diag_root
           echo "Diagnostic root: $DIAG_ROOT"
 
-          find "$DIAG_ROOT" -maxdepth 3 -type f -print
+      - name: Construct diagnostic evidence view
+        run: |
+          ENV_ROOT="$(cat /tmp/aee_env_root)"
+
+          rm -rf diagnostic_evidence
+          mkdir -p \
+            diagnostic_evidence/aee_post_build_environment
+
+          ln -s "$(realpath "$ENV_ROOT")" \
+            diagnostic_evidence/aee_post_build_environment/AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.1
+
+          test -f \
+            diagnostic_evidence/aee_post_build_environment/AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.1/work/candidate/tcb/gh
+
+          test -f \
+            diagnostic_evidence/aee_post_build_environment/AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.1/payload/aee_subject.tar
+
+          test -f \
+            diagnostic_evidence/aee_post_build_environment/AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.1/payload/aee_bundle.sigstore.json
+
+          echo "Diagnostic evidence view ready."
 
       - name: Execute non-authoritative runtime diagnostic
         run: |
           DIAG_ROOT="$(cat /tmp/aee_diag_root)"
+          EVID_ROOT="$(realpath diagnostic_evidence)"
 
-          test -f "$DIAG_ROOT/run_diagnostic.sh"
+          chmod +x "$DIAG_ROOT/scripts/run_diagnostic.sh"
 
-          chmod +x "$DIAG_ROOT/run_diagnostic.sh"
+          echo "=== NON-AUTHORITATIVE DIAGNOSTIC ==="
+          echo "This is NOT an N144 execution verdict."
 
-          cd "$DIAG_ROOT"
-
-          sudo ./run_diagnostic.sh
+          sudo "$DIAG_ROOT/scripts/run_diagnostic.sh" "$EVID_ROOT"
 
       - name: Preserve diagnostic evidence
         if: always()
@@ -78,5 +212,7 @@ jobs:
           name: AEE_N144_RUNTIME_DIAGNOSTIC_EVIDENCE
           path: |
             aee_n144_runtime_diagnostic/
+            diagnostic_evidence/
+            aee_post_build_environment/
           if-no-files-found: error
           retention-days: 30

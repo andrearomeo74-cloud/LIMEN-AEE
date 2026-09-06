@@ -1,0 +1,82 @@
+name: AEE N144 Runtime Diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    name: AEE N144 non-authoritative runtime diagnostic
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show runner identity
+        run: |
+          uname -a
+          uname -m
+          id
+
+      - name: Verify diagnostic package
+        run: |
+          test -f AEE_N144_RUNTIME_DIAGNOSTIC_v0.1.zip
+
+          DIAG_SHA="$(
+            sha256sum AEE_N144_RUNTIME_DIAGNOSTIC_v0.1.zip \
+            | awk '{print $1}'
+          )"
+
+          test "$DIAG_SHA" = \
+            "cf40a09b52b1b46a3cbbfd7ad4d7f5d3b7d7a8721c5ffee14c27dd895bc7d544"
+
+          echo "Diagnostic package SHA-256: $DIAG_SHA"
+
+      - name: Extract diagnostic package
+        run: |
+          rm -rf aee_n144_runtime_diagnostic
+          mkdir aee_n144_runtime_diagnostic
+
+          unzip -q AEE_N144_RUNTIME_DIAGNOSTIC_v0.1.zip \
+            -d aee_n144_runtime_diagnostic
+
+          DIAG_ROOT="$(
+            find aee_n144_runtime_diagnostic \
+              -type f \
+              -name 'run_diagnostic.sh' \
+              -printf '%h\n' \
+            | head -n 1
+          )"
+
+          test -n "$DIAG_ROOT"
+
+          echo "$DIAG_ROOT" > /tmp/aee_diag_root
+          echo "Diagnostic root: $DIAG_ROOT"
+
+          find "$DIAG_ROOT" -maxdepth 3 -type f -print
+
+      - name: Execute non-authoritative runtime diagnostic
+        run: |
+          DIAG_ROOT="$(cat /tmp/aee_diag_root)"
+
+          test -f "$DIAG_ROOT/run_diagnostic.sh"
+
+          chmod +x "$DIAG_ROOT/run_diagnostic.sh"
+
+          cd "$DIAG_ROOT"
+
+          sudo ./run_diagnostic.sh
+
+      - name: Preserve diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AEE_N144_RUNTIME_DIAGNOSTIC_EVIDENCE
+          path: |
+            aee_n144_runtime_diagnostic/
+          if-no-files-found: error
+          retention-days: 30

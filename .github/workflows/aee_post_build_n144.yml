@@ -31,14 +31,38 @@ jobs:
         run: |
           rm -rf aee_post_build_environment
           mkdir aee_post_build_environment
+
           unzip -q AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.1.zip \
             -d aee_post_build_environment
 
+          echo "=== Extracted package structure ==="
+          find aee_post_build_environment -maxdepth 4 -type f -print
+
       - name: Execute frozen N144 environment gate
-        working-directory: aee_post_build_environment
         run: |
-          chmod +x scripts/preflight.sh
-          chmod +x scripts/run_gate.sh
+          ENV_ROOT="$(
+            find aee_post_build_environment \
+              -type f \
+              -path '*/scripts/run_gate.sh' \
+              -printf '%h\n' \
+            | sed 's#/scripts$##' \
+            | head -n 1
+          )"
+
+          test -n "$ENV_ROOT"
+
+          echo "Frozen environment root: $ENV_ROOT"
+
+          test -f "$ENV_ROOT/scripts/preflight.sh"
+          test -f "$ENV_ROOT/scripts/run_gate.sh"
+          test -f "$ENV_ROOT/scripts/run_n144.py"
+          test -f "$ENV_ROOT/scripts/verify_and_stage.py"
+
+          chmod +x "$ENV_ROOT/scripts/preflight.sh"
+          chmod +x "$ENV_ROOT/scripts/run_gate.sh"
+
+          cd "$ENV_ROOT"
+
           sudo ./scripts/run_gate.sh
 
       - name: Preserve execution evidence

@@ -1,0 +1,52 @@
+name: AEE Post-Build N144
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  n144:
+    name: AEE N144 execution gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show runner identity
+        run: |
+          uname -a
+          uname -m
+          id
+
+      - name: Locate execution package
+        run: |
+          test -f AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.1.zip
+          sha256sum AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.1.zip
+
+      - name: Extract execution environment
+        run: |
+          rm -rf aee_post_build_environment
+          mkdir aee_post_build_environment
+          unzip -q AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.1.zip \
+            -d aee_post_build_environment
+
+      - name: Execute frozen N144 environment gate
+        working-directory: aee_post_build_environment
+        run: |
+          chmod +x scripts/preflight.sh
+          chmod +x scripts/run_gate.sh
+          sudo ./scripts/run_gate.sh
+
+      - name: Preserve execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AEE_N144_EXECUTION_EVIDENCE
+          path: |
+            aee_post_build_environment/
+          if-no-files-found: error
+          retention-days: 30

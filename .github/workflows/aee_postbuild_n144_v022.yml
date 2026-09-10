@@ -1,0 +1,65 @@
+name: AEE v0.2.2 POST-BUILD N144
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  n144:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify exact execution package
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG=AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.2.zip
+          test -f "$PKG"
+          echo '8539e51cf2d8342160d70c203572e062dbf4195e94650cb8e5e3682af868ff67  '"$PKG" | sha256sum -c -
+
+      - name: Extract exact environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.2
+          unzip -q AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.2.zip
+          test -d AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.2
+          chmod +x AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.2/scripts/*.sh
+          chmod +x AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.2/scripts/*.py
+
+      - name: Verify environment manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          r=Path('AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.2')
+          m=json.loads((r/'SHA256SUMS.json').read_text())
+          assert m['algorithm']=='SHA-256'
+          for e in m['entries']:
+              p=r/e['path']
+              assert p.is_file(), e['path']
+              assert p.stat().st_size==e['size'], e['path']
+              assert hashlib.sha256(p.read_bytes()).hexdigest()==e['sha256'], e['path']
+          print('ENVIRONMENT_MANIFEST_PASS',len(m['entries']))
+          PY
+
+      - name: Run privileged preflight and N144 only
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.2
+          sudo -E ./scripts/run_gate.sh
+
+      - name: Upload N144 execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AEE_v0.2.2_N144_EXECUTION_EVIDENCE
+          path: AEE_POST_BUILD_EXECUTION_ENVIRONMENT_v0.2/results/
+          if-no-files-found: error
